@@ -1,10 +1,6 @@
 """
 OpenAI-compatible API backend for proof generation.
-
-Works with:
-  - Closed-source models (OpenAI, Anthropic via proxy, Gemini via proxy, etc.)
-  - Open-source models served via `vllm serve <model> --port 8000`
-  - OpenRouter-hosted models (including reasoning models like Nemotron)
+...
 """
 
 import hashlib
@@ -20,10 +16,10 @@ from tqdm import tqdm
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils.utils import extract_code_blocks_as_list, write_to_json
+from rate_limiter import RateLimiter
 
 
 def _build_extra_headers(base_url: str) -> Optional[Dict[str, str]]:
-    """OpenRouter asks nicely for these identifying headers. Other backends ignore extra_headers."""
     if base_url and "openrouter.ai" in base_url:
         return {
             "HTTP-Referer": "https://localhost",
@@ -41,6 +37,7 @@ def _single_proof_attempt(
     temperature: float,
     top_p: float,
     retry_limit: int = 3,
+    rate_limiter: Optional[RateLimiter] = None,   # <-- new
 ) -> Dict:
     """Generate a single proof attempt via the API."""
     client = OpenAI(api_key=api_key, base_url=base_url)
@@ -49,13 +46,15 @@ def _single_proof_attempt(
     retries = 0
     while retries < retry_limit:
         try:
+            if rate_limiter is not None:
+                rate_limiter.acquire()   # <-- blocks here until a ticket is free
+
             kwargs = {
                 "model": model_name,
                 "messages": prompt_messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }
-            # o1 models don't support top_p
             if not model_name.startswith("o1"):
                 kwargs["top_p"] = top_p
             if extra_headers:
@@ -63,8 +62,6 @@ def _single_proof_attempt(
 
             response = client.chat.completions.create(**kwargs)
 
-            # Guard: the courier sometimes hands back an empty envelope.
-            # (This is the exact crash you hit in test_openrouter.py.)
             if not response.choices:
                 retries += 1
                 print(f"[API] Empty choices list, retrying ({retries}/{retry_limit})")
@@ -76,9 +73,6 @@ def _single_proof_attempt(
             resp_text = choice.message.content
             reasoning_text = getattr(choice.message, "reasoning", None)
 
-            # Guard: model got cut off before finishing its real answer.
-            # For reasoning models, this usually means resp_text is scratch-paper
-            # leftovers, not a finished proof -- worth retrying, not accepting.
             if finish_reason == "length":
                 retries += 1
                 print(f"[API] Truncated (finish_reason=length), retrying ({retries}/{retry_limit})")
@@ -102,7 +96,13 @@ def _single_proof_attempt(
         except Exception as e:
             retries += 1
             print(f"[API] Error: {e}")
-            time.sleep(2)
+            # A 429 means we guessed wrong about capacity -- back off harder
+            # than a normal retry, since the bucket may be shared with other
+            # traffic on this key (e.g. runs kicked off from another terminal).
+            if "429" in str(e):
+                time.sleep(15)
+            else:
+                time.sleep(2)
 
     return {"success": False}
 
@@ -120,6 +120,7 @@ def _process_single_record(
     top_p: float,
     retry_limit: int = 3,
     attempt_workers: int = 4,
+    rate_limiter: Optional[RateLimiter] = None,   # <-- new
 ) -> Dict:
     """Process a single dataset record: generate proof_num proofs with parallel attempts."""
     Path(ckpt_path).mkdir(parents=True, exist_ok=True)
@@ -130,7 +131,6 @@ def _process_single_record(
 
     record_file = Path(ckpt_path) / f"{rec['Name']}.json"
 
-    # Resume from checkpoint
     if record_file.exists():
         with open(record_file, "r", encoding="utf-8") as f:
             existing = json.load(f)
@@ -142,13 +142,13 @@ def _process_single_record(
     else:
         remaining = proof_num
 
-    # Parallel proof attempts
     with ProcessPoolExecutor(max_workers=attempt_workers) as executor:
         futures = [
             executor.submit(
                 _single_proof_attempt,
                 prompt_messages, model_name, base_url, api_key,
                 max_tokens, temperature, top_p, retry_limit,
+                rate_limiter,   # <-- new
             )
             for _ in range(remaining)
         ]
@@ -192,26 +192,19 @@ class APIBackend:
         dataset_workers: int = 4,
         attempt_workers: int = 4,
         retry_limit: int = 3,
+        requests_per_minute: Optional[int] = None,   # <-- new
     ) -> List[Dict]:
         """
-        Generate proofs for each record in the dataset.
-
-        Args:
-            dataset: List of theorem records.
-            prompt_messages_fn: Callable(rec) -> List[Dict] that builds prompt messages for a record.
-            proof_num: Number of proofs to generate per theorem.
-            temperature: Sampling temperature.
-            top_p: Top-p sampling parameter.
-            max_tokens: Maximum tokens per generation (scratch-work + final proof combined
-                        for reasoning models -- give this room, see prove_writer.py note).
-            ckpt_path: Directory for per-record checkpoint files.
-            dataset_workers: Parallelism across dataset records.
-            attempt_workers: Parallelism across proof attempts per record.
-            retry_limit: Attempts per proof before giving up (covers truncation/malformed responses).
-
-        Returns:
-            Updated dataset with Generated_proof and Proof_generation_log fields.
+        ...
+        requests_per_minute: If set, all workers share a single token-bucket
+            limiter capping total requests/minute across every process
+            (needed for OpenRouter free-tier's 20 RPM cap). None = unlimited.
         """
+        rate_limiter = (
+            RateLimiter.create(requests_per_minute)
+            if requests_per_minute else None
+        )
+
         results = []
         with ProcessPoolExecutor(max_workers=dataset_workers) as executor:
             futures = {
@@ -221,6 +214,7 @@ class APIBackend:
                     self.model_name, self.base_url, self.api_key,
                     ckpt_path, proof_num, max_tokens, temperature, top_p,
                     retry_limit, attempt_workers,
+                    rate_limiter,   # <-- new
                 ): rec
                 for rec in dataset
             }

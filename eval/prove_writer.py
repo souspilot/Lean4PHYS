@@ -93,11 +93,13 @@ def main():
                         help="Final output directory")
     parser.add_argument("--begin_idx", type=int, default=0)
     parser.add_argument("--end_idx", type=int, default=-1)
+    parser.add_argument("--retry_limit", type=int, default=2)
     parser.add_argument("--dataset_workers", type=int, default=4,
                         help="Parallelism across records (API mode)")
     parser.add_argument("--attempt_workers", type=int, default=4,
                         help="Parallelism per record (API mode)")
     parser.add_argument("--print_result", action="store_true")
+    parser.add_argument("--requests_per_minute", type=int, default=20)
     args = parser.parse_args()
 
     # Load dataset
@@ -164,6 +166,7 @@ def main():
             dataset_workers=args.dataset_workers,
             attempt_workers=args.attempt_workers,
             retry_limit=args.retry_limit,
+            requests_per_minute=args.requests_per_minute,
         )
 
     elif args.backend == "vllm":
