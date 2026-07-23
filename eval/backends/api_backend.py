@@ -16,7 +16,7 @@ from tqdm import tqdm
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils.utils import extract_code_blocks_as_list, write_to_json
-from rate_limiter import RateLimiter
+from backends.rate_limiter import RateLimiter
 
 
 def _build_extra_headers(base_url: str) -> Optional[Dict[str, str]]:

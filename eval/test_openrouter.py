@@ -33,7 +33,9 @@ try:
         },
         max_tokens=50
     )
-    
+
+    print(response.model_dump_json(indent=2))
+
     # 4. Print the output
     print("\n✅ Success! Received response:")
     print("-" * 40)
