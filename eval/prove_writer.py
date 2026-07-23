@@ -70,8 +70,8 @@ def main():
                         help="Inference backend: 'api' (OpenAI-compatible) or 'vllm' (direct)")
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1",
                         help="API base URL (only for --backend api)")
-    parser.add_argument("--api_key", type=str, default=os.environ.get("OPENROUTER_API_KEY", "EMPTY"),
-                        help="API key (only for --backend api)")
+    parser.add_argument("--key_name", type=str, default="OPENROUTER_API_KEY",
+                        help="Name of the environment variable holding the API key.")
     parser.add_argument("--use_lib", action="store_true",
                         help="Include PhysLib documentation in the prompt")
     parser.add_argument("--physlib_prompt", type=str, default="",
@@ -129,9 +129,14 @@ def main():
     if args.backend == "api":
         from backends.api_backend import APIBackend
 
+        api_key = os.environ.get(args.key_name, "EMPTY")
+
+        if api_key == "EMPTY":
+            print(f"⚠️  Warning: environment variable '{args.key_name}' not found.")
+
         backend = APIBackend(
             base_url=args.base_url,
-            api_key=args.api_key,
+            api_key=api_key,
             model_name=args.model,
         )
 
@@ -158,6 +163,7 @@ def main():
             ckpt_path=ckpt_dir,
             dataset_workers=args.dataset_workers,
             attempt_workers=args.attempt_workers,
+            retry_limit=args.retry_limit,
         )
 
     elif args.backend == "vllm":

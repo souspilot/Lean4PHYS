@@ -4,6 +4,7 @@ OpenAI-compatible API backend for proof generation.
 Works with:
   - Closed-source models (OpenAI, Anthropic via proxy, Gemini via proxy, etc.)
   - Open-source models served via `vllm serve <model> --port 8000`
+  - OpenRouter-hosted models (including reasoning models like Nemotron)
 """
 
 import hashlib
@@ -21,6 +22,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils.utils import extract_code_blocks_as_list, write_to_json
 
 
+def _build_extra_headers(base_url: str) -> Optional[Dict[str, str]]:
+    """OpenRouter asks nicely for these identifying headers. Other backends ignore extra_headers."""
+    if base_url and "openrouter.ai" in base_url:
+        return {
+            "HTTP-Referer": "https://localhost",
+            "X-Title": "LeanPhysBench Proof Generation",
+        }
+    return None
+
+
 def _single_proof_attempt(
     prompt_messages: List[Dict],
     model_name: str,
@@ -29,10 +40,11 @@ def _single_proof_attempt(
     max_tokens: int,
     temperature: float,
     top_p: float,
-    retry_limit: int = 1,
+    retry_limit: int = 3,
 ) -> Dict:
     """Generate a single proof attempt via the API."""
     client = OpenAI(api_key=api_key, base_url=base_url)
+    extra_headers = _build_extra_headers(base_url)
 
     retries = 0
     while retries < retry_limit:
@@ -46,9 +58,33 @@ def _single_proof_attempt(
             # o1 models don't support top_p
             if not model_name.startswith("o1"):
                 kwargs["top_p"] = top_p
+            if extra_headers:
+                kwargs["extra_headers"] = extra_headers
 
             response = client.chat.completions.create(**kwargs)
-            resp_text = response.choices[0].message.content
+
+            # Guard: the courier sometimes hands back an empty envelope.
+            # (This is the exact crash you hit in test_openrouter.py.)
+            if not response.choices:
+                retries += 1
+                print(f"[API] Empty choices list, retrying ({retries}/{retry_limit})")
+                time.sleep(2)
+                continue
+
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            resp_text = choice.message.content
+            reasoning_text = getattr(choice.message, "reasoning", None)
+
+            # Guard: model got cut off before finishing its real answer.
+            # For reasoning models, this usually means resp_text is scratch-paper
+            # leftovers, not a finished proof -- worth retrying, not accepting.
+            if finish_reason == "length":
+                retries += 1
+                print(f"[API] Truncated (finish_reason=length), retrying ({retries}/{retry_limit})")
+                time.sleep(1)
+                continue
+
             tokens = response.usage.completion_tokens if response.usage else 0
 
             blocks = extract_code_blocks_as_list(resp_text, code_type="lean4")
@@ -57,6 +93,7 @@ def _single_proof_attempt(
                     "success": True,
                     "proof_text": blocks[-1],
                     "resp": resp_text,
+                    "reasoning": reasoning_text,
                     "tokens": tokens,
                 }
             else:
@@ -81,7 +118,7 @@ def _process_single_record(
     max_tokens: int,
     temperature: float,
     top_p: float,
-    retry_limit: int = 1,
+    retry_limit: int = 3,
     attempt_workers: int = 4,
 ) -> Dict:
     """Process a single dataset record: generate proof_num proofs with parallel attempts."""
@@ -125,6 +162,7 @@ def _process_single_record(
                 rec["Proof_generation_log"].append({
                     "generation_idx": hashlib.sha256(proof_text.encode("utf-8")).hexdigest(),
                     "generated_content": result["resp"],
+                    "reasoning_content": result.get("reasoning"),
                     "generated_token_num": result["tokens"],
                     "generated_proof": proof_text,
                 })
@@ -153,6 +191,7 @@ class APIBackend:
         ckpt_path: str = "./checkpoints",
         dataset_workers: int = 4,
         attempt_workers: int = 4,
+        retry_limit: int = 3,
     ) -> List[Dict]:
         """
         Generate proofs for each record in the dataset.
@@ -163,10 +202,12 @@ class APIBackend:
             proof_num: Number of proofs to generate per theorem.
             temperature: Sampling temperature.
             top_p: Top-p sampling parameter.
-            max_tokens: Maximum tokens per generation.
+            max_tokens: Maximum tokens per generation (scratch-work + final proof combined
+                        for reasoning models -- give this room, see prove_writer.py note).
             ckpt_path: Directory for per-record checkpoint files.
             dataset_workers: Parallelism across dataset records.
             attempt_workers: Parallelism across proof attempts per record.
+            retry_limit: Attempts per proof before giving up (covers truncation/malformed responses).
 
         Returns:
             Updated dataset with Generated_proof and Proof_generation_log fields.
@@ -179,7 +220,7 @@ class APIBackend:
                     rec, prompt_messages_fn(rec),
                     self.model_name, self.base_url, self.api_key,
                     ckpt_path, proof_num, max_tokens, temperature, top_p,
-                    1, attempt_workers,
+                    retry_limit, attempt_workers,
                 ): rec
                 for rec in dataset
             }
