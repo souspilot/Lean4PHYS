@@ -28,6 +28,9 @@ import argparse
 import os
 import sys
 
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 from utils.utils import read_from_json, write_to_json
@@ -67,7 +70,7 @@ def main():
                         help="Inference backend: 'api' (OpenAI-compatible) or 'vllm' (direct)")
     parser.add_argument("--base_url", type=str, default="http://localhost:8000/v1",
                         help="API base URL (only for --backend api)")
-    parser.add_argument("--api_key", type=str, default=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+    parser.add_argument("--api_key", type=str, default=os.environ.get("OPENROUTER_API_KEY", "EMPTY"),
                         help="API key (only for --backend api)")
     parser.add_argument("--use_lib", action="store_true",
                         help="Include PhysLib documentation in the prompt")

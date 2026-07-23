@@ -119,29 +119,16 @@ class VLLMBackend:
         top_p: float = 0.95,
         repetition_penalty: float = 1.0,
         max_tokens: int = 8192,
-        batch_size: int = 4,
+        batch_size: int = 4, # Kept for arg compatibility, but ignored
         ckpt_path: str = "./checkpoints",
         print_result: bool = False,
     ) -> List[Dict]:
         """
         Generate proofs for each record in the dataset.
-
-        Args:
-            dataset: List of theorem records.
-            prompt_fn: Callable(rec) -> str that builds a formatted prompt string.
-            proof_num: Number of proofs per theorem.
-            temperature: Sampling temperature.
-            top_p: Top-p sampling.
-            repetition_penalty: Repetition penalty.
-            max_tokens: Max tokens per generation.
-            batch_size: vLLM batch size.
-            ckpt_path: Checkpoint directory.
-            print_result: Whether to print intermediate results.
-
-        Returns:
-            Updated dataset with Generated_proof and Proof_generation_log fields.
         """
-        import math
+        import hashlib
+        from pathlib import Path
+        from tqdm import tqdm
 
         Path(ckpt_path).mkdir(parents=True, exist_ok=True)
 
@@ -150,62 +137,54 @@ class VLLMBackend:
             rec.setdefault("Proof_generation_log", [])
             rec.setdefault("Proof_attempts", rec.get("Proof_attempts", 0))
 
-        # Build work items
-        work = []
+        all_prompts = []
+        owners = []
+
+        # Flatten the dataset into individual work items based on needed attempts
         for idx, rec in enumerate(dataset):
             need = max(0, proof_num - rec["Proof_attempts"])
             if need > 0:
                 prompt = prompt_fn(rec)
-                work.append({"idx": idx, "prompt": prompt, "need": need})
+                all_prompts.extend([prompt] * need)
+                owners.extend([idx] * need)
 
-        total = sum(w["need"] for w in work)
-        pbar = tqdm(total=total, desc="Generating proofs (vLLM)")
+        if not all_prompts:
+            return dataset
 
-        while True:
-            work = [w for w in work if w["need"] > 0]
-            if not work:
-                break
+        total = len(all_prompts)
+        pbar = tqdm(total=total, desc="Parsing vLLM Output")
 
-            batch_prompts, owners = [], []
-            for w in work:
-                while w["need"] > 0 and len(batch_prompts) < batch_size:
-                    batch_prompts.append(w["prompt"])
-                    owners.append(w["idx"])
-                    w["need"] -= 1
-                if len(batch_prompts) >= batch_size:
-                    break
+        # Hand the entire workload to vLLM at once to maximize GPU saturation
+        responses, gen_tok = self.generator.batched_query_model(
+            all_prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            sampling_num=1,
+        )
 
-            responses, gen_tok = self.generator.batched_query_model(
-                batch_prompts,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                sampling_num=1,
-            )
+        for prompt, resp, gtok, owner_idx in zip(all_prompts, responses, gen_tok, owners):
+            rec = dataset[owner_idx]
+            rec["Proof_attempts"] += 1
+            pbar.update(1)
 
-            for resp, gtok, owner_idx in zip(responses, gen_tok, owners):
-                rec = dataset[owner_idx]
-                prompt = batch_prompts[owners.index(owner_idx)]
-                rec["Proof_attempts"] += 1
-                pbar.update(1)
+            gen = resp[len(prompt):] if resp.startswith(prompt) else resp
+            blocks = extract_code_blocks_as_list(gen, code_type="lean4")
+            if blocks != -1 and len(blocks) > 0:
+                proof_text = blocks[-1]
+                rec["Generated_proof"].append(proof_text)
+                rec["Proof_generation_log"].append({
+                    "generation_idx": hashlib.sha256(proof_text.encode("utf-8")).hexdigest(),
+                    "generated_content": resp,
+                    "generated_token_num": gtok,
+                    "generated_proof": proof_text,
+                })
 
-                gen = resp[len(prompt):] if resp.startswith(prompt) else resp
-                blocks = extract_code_blocks_as_list(gen, code_type="lean4")
-                if blocks != -1 and len(blocks) > 0:
-                    proof_text = blocks[-1]
-                    rec["Generated_proof"].append(proof_text)
-                    rec["Proof_generation_log"].append({
-                        "generation_idx": hashlib.sha256(proof_text.encode("utf-8")).hexdigest(),
-                        "generated_content": resp,
-                        "generated_token_num": gtok,
-                        "generated_proof": proof_text,
-                    })
+            if print_result:
+                print(f"{'#' * 40}\nResponse:\n{resp}\n")
 
-                if print_result:
-                    print(f"{'#' * 40}\nResponse:\n{resp}\n")
-
-                write_to_json(f"{ckpt_path}/{rec['Name']}.json", rec)
+            write_to_json(f"{ckpt_path}/{rec['Name']}.json", rec)
 
         pbar.close()
         return dataset

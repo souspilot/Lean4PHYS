@@ -1,0 +1,45 @@
+{
+  "model": "qwen3_8B_verified",
+  "num_attempts": null,
+  "levels": {
+    "competition_easy": {
+      "total": 62,
+      "solved": 2,
+      "pass@None": 0.03225806451612903,
+      "solved_questions": [
+        "competition_optics_Ch17_question_8",
+        "competition_optics_Ch17_question_6"
+      ]
+    },
+    "college_level": {
+      "total": 103,
+      "solved": 4,
+      "pass@None": 0.038834951456310676,
+      "solved_questions": [
+        "university_mechanics_Mechanics_32_University",
+        "university_mechanics_Mechanics_2_University",
+        "university_mechanics_Mechanics_43_University",
+        "university_mechanics_Mechanics_34_University_copy"
+      ]
+    },
+    "competition_hard": {
+      "total": 33,
+      "solved": 0,
+      "pass@None": 0.0,
+      "solved_questions": []
+    }
+  },
+  "overall": {
+    "total": 198,
+    "solved": 6,
+    "pass@None": 0.030303030303030304,
+    "solved_questions": [
+      "competition_optics_Ch17_question_8",
+      "competition_optics_Ch17_question_6",
+      "university_mechanics_Mechanics_32_University",
+      "university_mechanics_Mechanics_2_University",
+      "university_mechanics_Mechanics_43_University",
+      "university_mechanics_Mechanics_34_University_copy"
+    ]
+  }
+}

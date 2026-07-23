@@ -23,6 +23,8 @@ credentials.json
 # OS
 .DS_Store
 Thumbs.db
+*._dbindex_*
+
 
 # IDE
 .vscode/
