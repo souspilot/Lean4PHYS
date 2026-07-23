@@ -7,11 +7,16 @@ worker does nothing to slow down the other workers. This uses
 multiprocessing.Manager to hold a shared "ticket count" that every process
 checks against before making a request.
 
-Usage:
-    limiter = RateLimiter.create(requests_per_minute=20)
+IMPORTANT: only the RateLimiter's proxy objects (lock, dict) get passed to
+worker processes -- never the Manager itself. The Manager object holds
+internal auth credentials that Python refuses to pickle across processes.
+Keep the Manager alive as a local variable in the process that creates it.
+
+Usage (in the main process only):
+    rate_limiter, manager = create_rate_limiter(requests_per_minute=20)
     ...
-    limiter.acquire()   # blocks until a ticket is available
-    response = client.chat.completions.create(...)
+    # pass rate_limiter (not manager) into ProcessPoolExecutor.submit(...)
+    # keep `manager` alive (in scope) for as long as workers are running
 """
 
 import time
@@ -20,31 +25,17 @@ from multiprocessing.managers import SyncManager
 
 class RateLimiter:
     """
-    Token-bucket limiter shared across processes via a Manager.
+    Token-bucket limiter shared across processes.
 
-    Not instantiated directly -- use RateLimiter.create(...), which spins up
-    the Manager and returns a lightweight handle. The handle itself IS
-    picklable (it only holds Manager proxy objects), so it can be passed
-    straight into ProcessPoolExecutor.submit(...) like any other argument.
+    Only holds Manager *proxy* objects (a Lock proxy, a dict proxy) -- these
+    are safe to pickle and pass into ProcessPoolExecutor workers. Never store
+    a reference to the SyncManager itself on this object.
     """
 
     def __init__(self, lock, state, requests_per_minute: int):
         self._lock = lock
         self._state = state  # Manager dict: {"tokens": float, "last_refill": float}
         self._rpm = requests_per_minute
-
-    @classmethod
-    def create(cls, requests_per_minute: int = 20) -> "RateLimiter":
-        manager = SyncManager()
-        manager.start()
-        lock = manager.Lock()
-        state = manager.dict()
-        state["tokens"] = float(requests_per_minute)
-        state["last_refill"] = time.time()
-        # Keep a reference so the manager process isn't garbage collected.
-        limiter = cls(lock, state, requests_per_minute)
-        limiter._manager = manager
-        return limiter
 
     def acquire(self):
         """Block until a request ticket is available, then take one."""
@@ -53,8 +44,6 @@ class RateLimiter:
                 now = time.time()
                 elapsed = now - self._state["last_refill"]
 
-                # Refill tokens continuously based on elapsed time
-                # (e.g. after 3 seconds at 20/min, ~1 new token has accrued).
                 refill = elapsed * (self._rpm / 60.0)
                 if refill > 0:
                     self._state["tokens"] = min(
@@ -66,8 +55,26 @@ class RateLimiter:
                     self._state["tokens"] -= 1.0
                     return
 
-                # Not enough tokens yet -- figure out how long until one frees up.
                 deficit = 1.0 - self._state["tokens"]
                 wait_time = deficit / (self._rpm / 60.0)
 
-            time.sleep(min(wait_time, 1.0))  # recheck at least once a second
+            time.sleep(min(wait_time, 1.0))
+
+
+def create_rate_limiter(requests_per_minute: int = 20):
+    """
+    Start a Manager and build a RateLimiter handle.
+
+    Returns (rate_limiter, manager). Pass `rate_limiter` into worker
+    processes. Keep `manager` alive (just leave it in scope) for as long as
+    any worker might still call rate_limiter.acquire() -- once `manager`
+    itself gets garbage collected, the shared state disappears.
+    """
+    manager = SyncManager()
+    manager.start()
+    lock = manager.Lock()
+    state = manager.dict()
+    state["tokens"] = float(requests_per_minute)
+    state["last_refill"] = time.time()
+    rate_limiter = RateLimiter(lock, state, requests_per_minute)
+    return rate_limiter, manager

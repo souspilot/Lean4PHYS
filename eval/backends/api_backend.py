@@ -16,7 +16,7 @@ from tqdm import tqdm
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils.utils import extract_code_blocks_as_list, write_to_json
-from backends.rate_limiter import RateLimiter
+from backends.rate_limiter import create_rate_limiter
 
 
 def _build_extra_headers(base_url: str) -> Optional[Dict[str, str]]:
@@ -192,18 +192,12 @@ class APIBackend:
         dataset_workers: int = 4,
         attempt_workers: int = 4,
         retry_limit: int = 3,
-        requests_per_minute: Optional[int] = None,   # <-- new
+        requests_per_minute: Optional[int] = None,
     ) -> List[Dict]:
-        """
-        ...
-        requests_per_minute: If set, all workers share a single token-bucket
-            limiter capping total requests/minute across every process
-            (needed for OpenRouter free-tier's 20 RPM cap). None = unlimited.
-        """
-        rate_limiter = (
-            RateLimiter.create(requests_per_minute)
-            if requests_per_minute else None
-        )
+        rate_limiter = None
+        manager = None   # keep this alive for the whole function -- see rate_limiter.py
+        if requests_per_minute:
+            rate_limiter, manager = create_rate_limiter(requests_per_minute)
 
         results = []
         with ProcessPoolExecutor(max_workers=dataset_workers) as executor:
@@ -214,7 +208,7 @@ class APIBackend:
                     self.model_name, self.base_url, self.api_key,
                     ckpt_path, proof_num, max_tokens, temperature, top_p,
                     retry_limit, attempt_workers,
-                    rate_limiter,   # <-- new
+                    rate_limiter,
                 ): rec
                 for rec in dataset
             }
